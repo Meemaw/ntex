@@ -1,5 +1,11 @@
 # Changes
 
+## [Unreleased]
+
+* Terminate the connection and record the error when filter processing fails in
+  `Io::poll_flush`, instead of propagating the error while leaving the io flags
+  looking consistent on a poisoned connection
+
 ## [3.12.2] - 2026-05-22
 
 * Do not use invalid io while adding new filter

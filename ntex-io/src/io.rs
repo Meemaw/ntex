@@ -605,7 +605,10 @@ impl<F> Io<F> {
         let st = self.st();
 
         // flush filter state
-        st.buffer.process_write_buf_force(self)?;
+        if let Err(e) = st.buffer.process_write_buf_force(self) {
+            st.terminate_connection(Some(e));
+            return Poll::Ready(Err(st.error_or_disconnected()));
+        }
         self.consolidate_write_state(false);
 
         let len = st.buffer.write_buf_size();
@@ -1372,5 +1375,45 @@ mod tests {
 
         let err = io.with_write_buf(|_| 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[ntex::test]
+    async fn flush_filter_error_terminates_connection() {
+        // a filter error during `poll_flush` buffer processing must terminate
+        // the connection and record the error, like every other call site does
+        #[derive(Debug)]
+        struct FlushErr;
+
+        impl FilterLayer for FlushErr {
+            fn process_read_buf(&self, _: &FilterBuf<'_>) -> io::Result<()> {
+                Ok(())
+            }
+            fn process_write_buf(&self, _: &FilterBuf<'_>) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "filter failure"))
+            }
+        }
+
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(1024);
+
+        let io = Io::new(server, SharedCfg::new("SRV")).add_filter(FlushErr);
+
+        // flush fails with the filter error
+        let Poll::Ready(Err(err)) = lazy(|cx| io.poll_flush(cx, false)).await else {
+            panic!("flush must fail")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // the io must be terminated
+        assert!(
+            io.st().flags.is_closed(),
+            "io must be closed after flush filter error"
+        );
+        // and the error must be recorded in the io state
+        let res = lazy(|cx| io.poll_status_update(cx)).await;
+        let Poll::Ready(crate::IoStatusUpdate::PeerGone(Some(err))) = res else {
+            panic!("expected PeerGone with error, got {res:?}")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

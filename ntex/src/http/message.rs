@@ -368,6 +368,7 @@ impl Head for ResponseHead {
         self.io = CurrentIo::None;
         self.flags = Flags::empty();
         self.extensions.get_mut().clear();
+        self.version = Version::default();
     }
 
     fn with_pool<F, R>(f: F) -> R

@@ -1,5 +1,10 @@
 # Changes
 
+## [Unreleased]
+
+* Reset `version` of pooled `ResponseHead` on release; a recycled head could expose a
+  stale HTTP version to middleware/loggers (e.g. on h2, where the version is never set)
+
 ## [3.9.8] - 2026-06-11
 
 * Reset method of pooled `RequestHead` on release; ws client could send a recycled
