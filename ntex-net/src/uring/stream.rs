@@ -280,9 +280,24 @@ impl Handler for StreamOpsHandler {
                         );
 
                         if cqueue::notif(flags) {
+                            // SendZc buffer-release notification. The kernel is
+                            // done with `buf` now, so this is the only place it
+                            // is safe to return the unwritten remainder. The data
+                            // completion (`more` arm) stashed the byte count into
+                            // `result`.
                             let res = result.unwrap_or(res).map(|n| {
                                 if n == 0 {
                                     item.ctx.stop(None);
+                                } else if n < buf.len() {
+                                    // Short send: return the unwritten tail to the
+                                    // front of the write buffer instead of dropping
+                                    // it. Mirrors the polling/tokio/compio drivers
+                                    // which `advance_to(n)` + prepend the remainder.
+                                    let mut page = buf;
+                                    page.advance_to(n);
+                                    item.ctx.with_write_buf(|wrt| {
+                                        wrt.prepend(page);
+                                    });
                                 }
                                 n > 0
                             });
@@ -293,8 +308,17 @@ impl Handler for StreamOpsHandler {
                             // reset op reference
                             item.wr_op.take();
 
-                            // try to send next chunk
-                            if res.is_ok() {
+                            // SendZc data completion. `res` carries the byte count
+                            // `n`. Only eagerly submit the next chunk on a FULL send
+                            // (`n == buf.len()`). On a partial send we must NOT send
+                            // the next page here: the unwritten remainder of `buf`
+                            // is only returned to the write buffer once the kernel
+                            // releases it in the `notif` arm above. Submitting the
+                            // next page now would jump it ahead of this page's
+                            // remainder and corrupt the stream. For a partial send
+                            // the `notif` arm prepends the remainder and the normal
+                            // `update_write_status -> st.send` path resubmits it.
+                            if matches!(res, Ok(n) if n == buf.len()) {
                                 st.send(id, &self.inner.api);
                             }
                             // insert op back for "notify" handling
@@ -308,10 +332,22 @@ impl Handler for StreamOpsHandler {
                             // reset op reference
                             item.wr_op.take();
 
-                            // release buffer and try to send next chunk
+                            // Plain (non-ZC) send single completion. Release buffer
+                            // and try to send next chunk.
                             let res = res.map(|n| {
                                 if n == 0 {
                                     item.ctx.stop(None);
+                                } else if n < buf.len() {
+                                    // Short send: return the unwritten tail to the
+                                    // front of the write buffer so the following
+                                    // `st.send` resubmits it instead of dropping it.
+                                    // Mirrors the polling/tokio/compio drivers
+                                    // (`advance_to(n)` + prepend the remainder).
+                                    let mut page = buf;
+                                    page.advance_to(n);
+                                    item.ctx.with_write_buf(|wrt| {
+                                        wrt.prepend(page);
+                                    });
                                 }
                                 n > 0
                             });

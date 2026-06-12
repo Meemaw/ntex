@@ -453,3 +453,69 @@ async fn basic_connect_service() {
     let result = srv.connect(format!("{}", server.addr())).await;
     assert!(result.is_ok());
 }
+
+/// Slow reader forces the server-side socket send buffer to fill up,
+/// producing short (partial) writes on the server. Every byte must
+/// still arrive intact and in order.
+///
+/// Regression test for the io-uring driver losing the unwritten tail
+/// of partially completed send operations.
+#[ntex::test]
+async fn test_partial_writes_under_backpressure() {
+    const TOTAL: usize = 16 * 1024 * 1024;
+    const CHUNK: usize = 256 * 1024;
+
+    fn pattern_byte(pos: usize) -> u8 {
+        (pos % 251) as u8
+    }
+
+    let srv = test_server(async || {
+        fn_service(|io: Io| async move {
+            let mut data = Vec::with_capacity(TOTAL);
+            for pos in 0..TOTAL {
+                data.push(pattern_byte(pos));
+            }
+            let data = Bytes::from(data);
+
+            let mut pos = 0;
+            while pos < TOTAL {
+                let end = std::cmp::min(pos + CHUNK, TOTAL);
+                if io.send(data.slice(pos..end), &BytesCodec).await.is_err() {
+                    return Ok(());
+                }
+                pos = end;
+            }
+            let _ = io.recv(&BytesCodec).await;
+            Ok::<_, io::Error>(())
+        })
+    });
+
+    let addr = srv.addr();
+    let client = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        let mut buf = [0u8; 8192];
+        let mut total = 0;
+        let mut mismatch = None;
+        while total < TOTAL {
+            let n = match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if mismatch.is_none() {
+                for (i, b) in buf[..n].iter().enumerate() {
+                    if *b != pattern_byte(total + i) { mismatch = Some(total + i); break; }
+                }
+            }
+            total += n;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        (total, mismatch)
+    });
+
+    let (total, mismatch) = client.join().unwrap();
+    assert_eq!(total, TOTAL, "client received {total} bytes, expected {TOTAL} (data lost)");
+    assert_eq!(mismatch, None, "received data corrupted at offset {mismatch:?}");
+}

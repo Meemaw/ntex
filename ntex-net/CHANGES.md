@@ -1,5 +1,9 @@
 # Changes
 
+## [Unreleased]
+
+* io_uring driver: return the unwritten remainder of a partially-completed send back to the write buffer instead of silently dropping it (data corruption / truncation under write backpressure)
+
 ## [3.12.0] - 2026-05-15
 
 * Update ntex-io
